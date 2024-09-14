@@ -33,8 +33,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <linux/input.h>
+#include <rfb/rfbclient.h>
 #include "draw.h"
 #include "vnc.h"
+
 
 #define MIN(a, b)	((a) < (b) ? (a) : (b))
 #define MAX(a, b)	((a) > (b) ? (a) : (b))
@@ -56,87 +58,45 @@ static long vnc_nw;		/* number of bytes sent */
 
 static char buf[MAXRES];
 
-static int vnc_connect(char *addr, char *port)
-{
-	struct addrinfo hints, *addrinfo;
-	int fd;
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE;
-
-	if (getaddrinfo(addr, port, &hints, &addrinfo))
-		return -1;
-	fd = socket(addrinfo->ai_family, addrinfo->ai_socktype,
-			addrinfo->ai_protocol);
-
-	if (connect(fd, addrinfo->ai_addr, addrinfo->ai_addrlen) == -1) {
-		close(fd);
-		freeaddrinfo(addrinfo);
-		return -1;
+static rfbCredential* get_credential(rfbClient* cl, int credentialType){
+	rfbCredential *c = malloc(sizeof(rfbCredential));
+	if (!c) {
+		return NULL;
 	}
-	freeaddrinfo(addrinfo);
-	return fd;
+	c->userCredential.username = malloc(RFB_BUF_SIZE);
+	if (!c->userCredential.username) {
+		free(c);
+		return NULL;
+	}
+	c->userCredential.password = malloc(RFB_BUF_SIZE);
+	if (!c->userCredential.password) {
+		free(c->userCredential.username);
+		free(c);
+		return NULL;
+	}
+
+	if(credentialType != rfbCredentialTypeUser) {
+	    rfbClientErr("something else than username and password required for authentication\n");
+	    return NULL;
+	}
+
+	rfbClientLog("username and password required for authentication!\n");
+	printf("user: ");
+	fgets(c->userCredential.username, RFB_BUF_SIZE, stdin);
+	printf("pass: ");
+	fgets(c->userCredential.password, RFB_BUF_SIZE, stdin);
+
+	/* remove trailing newlines */
+	c->userCredential.username[strcspn(c->userCredential.username, "\n")] = 0;
+	c->userCredential.password[strcspn(c->userCredential.password, "\n")] = 0;
+
+	return c;
 }
 
-static void fbmode_bits(int *rr, int *rg, int *rb)
+static int vnc_init(rfbClient *cl)
 {
-	int mode = FBM_CLR(fb_mode());
-	*rr = (mode >> 8) & 0xf;
-	*rg = (mode >> 4) & 0xf;
-	*rb = (mode >> 0) & 0xf;
-}
-
-static int vread(int fd, void *buf, long len)
-{
-	long nr = 0;
-	long n;
-	while (nr < len && (n = read(fd, buf + nr, len - nr)) > 0)
-		nr += n;
-	vnc_nr += nr;
-	if (nr < len)
-		printf("fbvnc: partial vnc read!\n");
-	return nr < len ? -1 : len;
-}
-
-static int vwrite(int fd, void *buf, long len)
-{
-	int nw = write(fd, buf, len);
-	if (nw != len)
-		printf("fbvnc: partial vnc write!\n");
-	vnc_nw += len;
-	return nw < len ? -1 : nw;
-}
-
-static int vnc_init(int fd)
-{
-	char vncver[16];
-	int rr, rg, rb;
-	struct vnc_clientinit clientinit;
-	struct vnc_serverinit serverinit;
-	struct vnc_setpixelformat pixfmt_cmd;
-	struct vnc_setencoding enc_cmd;
-	u32 enc[] = {htonl(VNC_ENC_RAW), htonl(VNC_ENC_RRE)};
-	int connstat = VNC_CONN_FAILED;
-
-	/* handshake */
-	if (vread(fd, vncver, 12) < 0)
-		return -1;
-	strcpy(vncver, "RFB 003.003\n");
-	vwrite(fd, vncver, 12);
-	if (vread(fd, &connstat, sizeof(connstat)) < 0)
-		return -1;
-	if (ntohl(connstat) != VNC_CONN_NOAUTH)
-		return -1;
-	clientinit.shared = 1;
-	vwrite(fd, &clientinit, sizeof(clientinit));
-	if (vread(fd, &serverinit, sizeof(serverinit)) < 0)
-		return -1;
-	if (vread(fd, buf, ntohl(serverinit.len)) < 0)
-		return -1;
-	srv_cols = ntohs(serverinit.w);
-	srv_rows = ntohs(serverinit.h);
+	srv_cols = cl->width;
+	srv_rows = cl->height;
 
 	/* set up the framebuffer */
 	if (fb_init(getenv("FBDEV")))
@@ -147,161 +107,84 @@ static int vnc_init(int fd)
 	mr = rows / 2;
 	mc = cols / 2;
 
-	/* send framebuffer configuration */
-	pixfmt_cmd.type = VNC_SETPIXELFORMAT;
-	pixfmt_cmd.format.bpp = bpp << 3;
-	pixfmt_cmd.format.depth = bpp << 3;
-	pixfmt_cmd.format.bigendian = 0;
-	pixfmt_cmd.format.truecolor = 1;
-	fbmode_bits(&rr, &rg, &rb);
-	pixfmt_cmd.format.rmax = htons((1 << rr) - 1);
-	pixfmt_cmd.format.gmax = htons((1 << rg) - 1);
-	pixfmt_cmd.format.bmax = htons((1 << rb) - 1);
 
-	/* assuming colors packed as RGB; shall handle other cases later */
-	pixfmt_cmd.format.rshl = rg + rb;
-	pixfmt_cmd.format.gshl = rb;
-	pixfmt_cmd.format.bshl = 0;
-	vwrite(fd, &pixfmt_cmd, sizeof(pixfmt_cmd));
+	// cl->format.redMax=255;
+	// cl->format.greenMax=255;
+	// cl->format.blueMax=255;
 
-	/* send pixel format */
-	enc_cmd.type = VNC_SETENCODING;
-	enc_cmd.pad = 0;
-	enc_cmd.n = htons(2);
-	vwrite(fd, &enc_cmd, sizeof(enc_cmd));
-	vwrite(fd, enc, ntohs(enc_cmd.n) * sizeof(enc[0]));
+	// rfbPixelFormat format = cl->format;
+    // printf("Bits per pixel: %d\n", format.bitsPerPixel);
+    // printf("Depth: %d\n", format.depth);
+    // printf("Big Endian: %s\n", format.bigEndian ? "Yes" : "No");
+    // printf("True Colour: %s\n", format.trueColour ? "Yes" : "No");
+    // printf("Red max: %d, shift: %d\n", format.redMax, format.redShift);
+    // printf("Green max: %d, shift: %d\n", format.greenMax, format.greenShift);
+    // printf("Blue max: %d, shift: %d\n", format.blueMax, format.blueShift);
+
 	return 0;
 }
 
-static int vnc_free(void)
+// TODO: modify using rfbSendFramebufferUpdateRequest
+// do I need to refresh the fb?
+// static int vnc_refresh(int fd, int inc)
+// {
+// 	struct vnc_updaterequest fbup_req;
+// 	fbup_req.type = VNC_UPDATEREQUEST;
+// 	fbup_req.inc = inc;
+// 	fbup_req.x = htons(oc);
+// 	fbup_req.y = htons(or);
+// 	fbup_req.w = htons(cols);
+// 	fbup_req.h = htons(rows);
+// 	return vwrite(fd, &fbup_req, sizeof(fbup_req)) < 0 ? -1 : 0;
+// }
+
+static inline void fb_set(int r, int c, void *mem, int len)
 {
-	fb_free();
-	return 0;
+	//memcpy(fb_mem(r) + c * bpp, mem, len * bpp);
+	int i,j;
+	for(i=0;i<len;i++){
+		//memcpy(fb_mem(r) + (c + i)*bpp, mem + i*bpp, 4);
+		for(j=0;j<4;j++){
+			*(char*)(fb_mem(r) + (c + i)*bpp + j) = *(char*)(mem + i*bpp + j);
+		}
+	}
 }
 
-static int vnc_refresh(int fd, int inc)
+// x, y, w, h are server framebuffer coordinates
+// Assume server framebuffer can be larger than client framebuffer
+static void drawfb(unsigned char *s, int x, int y, int w, int h)
 {
-	struct vnc_updaterequest fbup_req;
-	fbup_req.type = VNC_UPDATEREQUEST;
-	fbup_req.inc = inc;
-	fbup_req.x = htons(oc);
-	fbup_req.y = htons(or);
-	fbup_req.w = htons(cols);
-	fbup_req.h = htons(rows);
-	return vwrite(fd, &fbup_req, sizeof(fbup_req)) < 0 ? -1 : 0;
-}
-
-static void fb_set(int r, int c, void *mem, int len)
-{
-	memcpy(fb_mem(r) + c * bpp, mem, len * bpp);
-}
-
-static void drawfb(char *s, int x, int y, int w, int h)
-{
-	int sc;		/* screen column offset */
-	int bc, bw;	/* buffer column offset / row width */
+	int sc, sr;		/* starting column, row in client fb */
+	int er, ec;		/* ending column, row in client fb, non-inclusive */
 	int i;
+
+	// the region being updated does not intersect with current visible region
+	if(x+w < oc || x > oc+cols || y+h < or || y > or+rows) return;
+
+	sr = MAX(0, y - or);
 	sc = MAX(0, x - oc);
-	bc = x > oc ? 0 : oc - x;
-	bw = x + w < oc + cols ? w - bc : w - bc - (x + w - oc - cols);
-	for (i = y; i < y + h; i++)
-		if (i - or >= 0 && i - or < rows && bw > 0)
-			fb_set(i - or, sc, s + ((i - y) * w + bc) * bpp, bw);
+	er = MIN(or + rows, y+h-or);
+	ec = MIN(oc + cols, x+w-oc);
+
+	for (i = sr; i < er; i++)
+		fb_set(i, sc, s + ((i + or) * srv_cols + sc + oc) * bpp, ec - sc);
 }
 
-static void drawrect(char *pixel, int x, int y, int w, int h)
-{
-	int i;
-	if (x < 0 || x + w >= srv_cols || y < 0 || y + h >= srv_rows)
-		return;
-	for (i = 0; i < w; i++)
-		memcpy(buf + i * bpp, pixel, bpp);
-	for (i = 0; i < h; i++)
-		drawfb(buf, x, y + i, w, 1);
+static inline void update(rfbClient* cl,int x,int y,int w,int h) {
+	//printf("called update %d %d %d %d\n", x, y, w, h);
+	drawfb(cl->frameBuffer, x, y, w, h);
+	// int i,j;
+	// for(i=0;i<rows;i++){
+	// 	for(j=0;j<cols;j++){
+	// 		char* from = cl->frameBuffer + i * srv_
+	// 	}
+	// }
 }
 
-static int readrect(int fd)
-{
-	struct vnc_rect uprect;
-	int x, y, w, h;
-	int i;
-	if (vread(fd, &uprect, sizeof(uprect)) <  0)
-		return -1;
-	x = ntohs(uprect.x);
-	y = ntohs(uprect.y);
-	w = ntohs(uprect.w);
-	h = ntohs(uprect.h);
-	if (x < 0 || w < 0 || x + w > srv_cols)
-		return -1;
-	if (y < 0 || h < 0 || y + h > srv_rows)
-		return -1;
-	if (uprect.enc == htonl(VNC_ENC_RAW)) {
-		for (i = 0; i < h; i++) {
-			if (vread(fd, buf, w * bpp) < 0)
-				return -1;
-			if (!nodraw)
-				drawfb(buf, x, y + i, w, 1);
-		}
-	}
-	if (uprect.enc == htonl(VNC_ENC_RRE)) {
-		char pixel[8];
-		u32 n;
-		vread(fd, &n, 4);
-		vread(fd, pixel, bpp);
-		if (!nodraw)
-			drawrect(pixel, x, y, w, h);
-		for (i = 0; i < ntohl(n); i++) {
-			u16 pos[4];
-			vread(fd, pixel, bpp);
-			vread(fd, pos, 8);
-			if (!nodraw)
-				drawrect(pixel, x + ntohs(pos[0]), y + ntohs(pos[1]),
-					ntohs(pos[2]), ntohs(pos[3]));
-		}
-	}
-	return 0;
-}
-
-static int vnc_event(int fd)
-{
-	char msg[1 << 12];
-	struct vnc_update *fbup = (void *) msg;
-	struct vnc_servercuttext *cuttext = (void *) msg;
-	struct vnc_setcolormapentries *colormap = (void *) msg;
-	int i;
-	int n;
-
-	if (vread(fd, msg, 1) < 0)
-		return -1;
-	switch (msg[0]) {
-	case VNC_UPDATE:
-		vread(fd, msg + 1, sizeof(*fbup) - 1);
-		n = ntohs(fbup->n);
-		for (i = 0; i < n; i++)
-			if (readrect(fd))
-				return -1;
-		break;
-	case VNC_BELL:
-		break;
-	case VNC_SERVERCUTTEXT:
-		vread(fd, msg + 1, sizeof(*cuttext) - 1);
-		vread(fd, buf, ntohl(cuttext->len));
-		break;
-	case VNC_SETCOLORMAPENTRIES:
-		vread(fd, msg + 1, sizeof(*colormap) - 1);
-		vread(fd, buf, ntohs(colormap->n) * 3 * 2);
-		break;
-	default:
-		fprintf(stderr, "fbvnc: unknown vnc msg %d\n", msg[0]);
-		return -1;
-	}
-	return 0;
-}
-
-static int rat_event(int fd, int ratfd)
+//TODO: modify mouse handler using SendPointerEvent
+static int rat_event(rfbClient *cl, int ratfd)
 {
 	char ie[4] = {0};
-	struct vnc_pointerevent me = {VNC_POINTEREVENT};
 	int mask = 0;
 	int or_ = or, oc_ = oc;
 	if (ratfd > 0 && read(ratfd, &ie, sizeof(ie)) != 4)
@@ -323,32 +206,20 @@ static int rat_event(int fd, int ratfd)
 	mc = MAX(oc, MIN(oc + cols - 1, mc));
 	mr = MAX(or, MIN(or + rows - 1, mr));
 	if (ie[0] & 0x01)
-		mask |= VNC_BUTTON1_MASK;
+		mask |= rfbButton1Mask;
 	if (ie[0] & 0x04)
-		mask |= VNC_BUTTON2_MASK;
+		mask |= rfbButton2Mask;
 	if (ie[0] & 0x02)
-		mask |= VNC_BUTTON3_MASK;
+		mask |= rfbButton3Mask;
 	if (ie[3] > 0)		/* wheel up */
-		mask |= VNC_BUTTON4_MASK;
+		mask |= rfbButton4Mask;
 	if (ie[3] < 0)		/* wheel down */
-		mask |= VNC_BUTTON5_MASK;
+		mask |= rfbButton5Mask;
 
-	me.y = htons(mr);
-	me.x = htons(mc);
-	me.mask = mask;
-	vwrite(fd, &me, sizeof(me));
+	SendPointerEvent(cl, mc, mr, mask);
+	// if visible region changed, need a full refresh
 	if (or != or_ || oc != oc_)
-		if (vnc_refresh(fd, 0))
-			return -1;
-	return 0;
-}
-
-static int press(int fd, int key, int down)
-{
-	struct vnc_keyevent ke = {VNC_KEYEVENT};
-	ke.key = htonl(key);
-	ke.down = down;
-	vwrite(fd, &ke, sizeof(ke));
+		SendFramebufferUpdateRequest(cl, oc, or, cols, rows, FALSE);
 	return 0;
 }
 
@@ -368,7 +239,8 @@ static void nodraw_set(int val)
 	nodraw = val;
 }
 
-static int kbd_event(int fd, int kbdfd)
+//TODO: modify keyboard handler using SendKeyEvent
+static int kbd_event(rfbClient *cl, int kbdfd)
 {
 	char key[1024];
 	int i, nr;
@@ -429,11 +301,12 @@ static int kbd_event(int fd, int kbdfd)
 		if (k > 0) {
 			int j;
 			for (j = 0; j < nmod; j++)
-				press(fd, mod[j], 1);
-			press(fd, k, 1);
-			press(fd, k, 0);
+				SendKeyEvent(cl, mod[j], 1);
+				
+			SendKeyEvent(cl, k, 1);
+			SendKeyEvent(cl, k, 0);
 			for (j = 0; j < nmod; j++)
-				press(fd, mod[j], 0);
+				SendKeyEvent(cl, mod[j], 0);
 		}
 	}
 	return 0;
@@ -457,45 +330,45 @@ static void term_cleanup(struct termios *ti)
 	OUT("\r\n\033[?25h");	/* show the cursor */
 }
 
-static void mainloop(int vnc_fd, int kbd_fd, int rat_fd)
+//TODO
+static void mainloop(rfbClient *cl, int kbd_fd, int rat_fd)
 {
 	struct pollfd ufds[3];
-	int pending = 0;
 	int err;
 	ufds[0].fd = kbd_fd;
 	ufds[0].events = POLLIN;
-	ufds[1].fd = vnc_fd;
+	ufds[1].fd = rat_fd;
 	ufds[1].events = POLLIN;
-	ufds[2].fd = rat_fd;
+	ufds[2].fd = cl->sock;
 	ufds[2].events = POLLIN;
-	rat_event(vnc_fd, -1);
-	if (vnc_refresh(vnc_fd, 0))
-		return;
+	//rat_event(vnc_fd, -1); // what does this do
 	while (1) {
 		err = poll(ufds, 3, 500);
 		if (err == -1 && errno != EINTR)
 			break;
-		if (!err)
-			continue;
-		if (ufds[0].revents & POLLIN)
-			if (kbd_event(vnc_fd, kbd_fd) == -1)
-				break;
-		if (ufds[1].revents & POLLIN) {
-			if (vnc_event(vnc_fd) == -1)
-				break;
-			pending = 0;
+		if (err){
+			if (ufds[0].revents & POLLIN)
+				if (kbd_event(cl, kbd_fd) == -1)
+					break;
+			if (ufds[1].revents & POLLIN)
+				if (rat_event(cl, rat_fd) == -1)
+					break;
+			if (ufds[2].revents & POLLIN){
+				if(WaitForMessage(cl, 0) < 0){
+					rfbClientCleanup(cl);
+					break;
+				}
+				if(!HandleRFBServerMessage(cl))
+				{
+					rfbClientCleanup(cl);
+					break;
+				}
+				// printf("called HandleRFBServerMessage\n");
+				// I want to only keep track of the current part of the screen,
+				// But libvncclient automatically requests the full framebuffer
+				// SendFramebufferUpdateRequest(cl, 0, 0, cols, rows, TRUE);
+			}
 		}
-		if (ufds[2].revents & POLLIN)
-			if (rat_event(vnc_fd, rat_fd) == -1)
-				break;
-		if (!nodraw && nodraw_ref) {
-			nodraw_ref = 0;
-			if (vnc_refresh(vnc_fd, 0))
-				break;
-		}
-		if (!pending++)
-			if (vnc_refresh(vnc_fd, 1))
-				break;
 	}
 }
 
@@ -509,23 +382,35 @@ static void signalreceived(int sig)
 
 int main(int argc, char * argv[])
 {
-	char *port = VNC_PORT;
-	char *host = "127.0.0.1";
 	struct termios ti;
-	int vnc_fd, rat_fd;
-	if (argc >= 2 && argv[1][0] && strcmp("-", argv[1]))
-		host = argv[1];
-	if (argc >= 3)
-		port = argv[2];
-	if ((vnc_fd = vnc_connect(host, port)) < 0) {
-		fprintf(stderr, "fbvnc: could not connect!\n");
-		return 1;
+	int rat_fd;
+	rfbClient* cl;
+
+	// initialize rfbClient
+	/* 16-bit: cl=rfbGetClient(5,3,2); */
+	cl=rfbGetClient(8,3,4);
+
+	cl->GotFrameBufferUpdate=update;
+	cl->GetCredential = get_credential;
+    cl->format.redShift=16;
+	cl->format.greenShift=8;
+	cl->format.blueShift=0;
+
+	if(!rfbInitClient(cl,&argc,argv))
+	{
+		cl = NULL; /* rfbInitClient has already freed the client struct */
+		printf("failed to initialize vnc client\n");
+		rfbClientCleanup(cl);
+		return -1;
 	}
-	if (vnc_init(vnc_fd) < 0) {
-		close(vnc_fd);
-		fprintf(stderr, "fbvnc: vnc init failed!\n");
-		return 1;
+
+	if(vnc_init(cl) < 0){
+		return -1;
 	}
+
+	// only keep track of part of the screen
+	SendFramebufferUpdateRequest(cl, 0, 0, cols, rows, TRUE);
+
 	if (getenv("TERM_PGID") != NULL && atoi(getenv("TERM_PGID")) == getppid())
 		if (tcsetpgrp(0, getppid()) == 0)
 			setpgid(0, getppid());
@@ -537,12 +422,10 @@ int main(int argc, char * argv[])
 	read(rat_fd, buf, 1);
 	signal(SIGUSR1, signalreceived);
 	signal(SIGUSR2, signalreceived);
-
-	mainloop(vnc_fd, 0, rat_fd);
+	mainloop(cl, 0, rat_fd);
 
 	term_cleanup(&ti);
-	vnc_free();
-	close(vnc_fd);
+	fb_free();
 	close(rat_fd);
 	return 0;
 }
